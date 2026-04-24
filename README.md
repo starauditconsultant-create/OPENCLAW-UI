@@ -1,19 +1,24 @@
 # OpenClaw Visual Dashboard (.EXE Builder)
 
-A live graphical monitoring dashboard for OpenClaw with real-time metrics, log intelligence, timeline tracking, and Windows executable support.
+Advanced desktop control center for OpenClaw with live telemetry, event intelligence, and Windows EXE packaging.
 
-## Features
+## Core Features
 
-- Live log monitoring (`logs/openclaw.log` tailing)
-- CPU/RAM live graphs
-- Browser status indicator
-- Error counter
-- Task execution timeline
-- Real-time AI activity map
-- Autonomous agent status panel
-- Interactive command center buttons (restart browser, emergency stop, clear timeline)
-- Log export
-- Windows `.exe` build support
+- Live log monitoring with `watchdog` file events
+- Structured log classification (INFO/WARN/ERROR)
+- Real-time CPU / RAM charts
+- OpenClaw process health counter + CPU usage
+- Browser connectivity status detection
+- Task extraction from logs
+- Autonomous agent graph (Planner, Browser, Vision, Verifier, Recovery)
+- Real-time AI activity feed + decision timeline
+- Command center actions:
+  - Export Logs
+  - Clear Timeline
+  - Restart Browser
+  - Emergency Stop
+- Export snapshots to `exports/`
+- Windows `.exe` build support via `pyinstaller`
 
 ## Folder Structure
 
@@ -23,6 +28,7 @@ openclaw-dashboard/
 ├── requirements.txt
 ├── logs/
 │   └── openclaw.log
+├── exports/
 └── assets/
 ```
 
@@ -44,7 +50,7 @@ python dashboard.py
 pyinstaller --onefile --windowed dashboard.py
 ```
 
-EXE output:
+Output:
 
 ```text
 /dist/dashboard.exe
@@ -53,21 +59,15 @@ EXE output:
 ## Optional EXE Optimization
 
 ```powershell
-pyinstaller --onefile --windowed --icon=icon.ico dashboard.py
+pyinstaller --onefile --windowed --icon=icon.ico --noconsole dashboard.py
 ```
 
-Optional flag:
+## Advanced Roadmap (Enterprise)
 
-```powershell
---noconsole
-```
-
-## Advanced Feature Roadmap
-
-- Live browser stream panel
-- Mouse movement visualizer + click heatmaps
-- OCR viewer panel
-- Voice command integration
-- Database-backed session logging
-- Remote web dashboard (Flask + WebSocket)
-- Plugin architecture
+- Live browser preview stream panel
+- OCR overlay + confidence panel
+- Click heatmaps and mouse trajectory playback
+- Persistent SQLite/PostgreSQL event storage
+- Plugin architecture (`plugins/`)
+- Remote web monitoring backend (Flask + WebSocket)
+- Predictive failure scoring for agent actions

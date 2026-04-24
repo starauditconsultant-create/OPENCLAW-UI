@@ -1,39 +1,136 @@
 import os
 import queue
+import re
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import customtkinter as ctk
 import psutil
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / "openclaw.log"
+EXPORT_DIR = BASE_DIR / "exports"
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+
+
+@dataclass
+class LogEvent:
+    raw: str
+    timestamp: str
+    level: str = "INFO"
+    task: Optional[str] = None
+    agent: Optional[str] = None
+    browser_connected: Optional[bool] = None
+
+
+class LogClassifier:
+    LEVEL_PATTERNS = {
+        "ERROR": [r"\berror\b", r"\bfailed\b", r"\bexception\b", r"\btraceback\b"],
+        "WARN": [r"\bwarn\b", r"\bretry\b", r"\btimeout\b"],
+    }
+
+    AGENT_PATTERNS = {
+        "Planner Agent": [r"planner", r"plan"],
+        "Browser Agent": [r"browser", r"page", r"navigate"],
+        "Vision Agent": [r"vision", r"ocr", r"image"],
+        "Verifier Agent": [r"verify", r"validated", r"assert"],
+        "Recovery Agent": [r"recover", r"rollback", r"retry"],
+    }
+
+    TASK_PATTERN = re.compile(r"\btask\b[:\- ]*(.*)", re.IGNORECASE)
+
+    @classmethod
+    def classify(cls, line: str) -> LogEvent:
+        lower = line.lower()
+        level = "INFO"
+
+        for candidate, patterns in cls.LEVEL_PATTERNS.items():
+            if any(re.search(pattern, lower) for pattern in patterns):
+                level = candidate
+                break
+
+        agent = None
+        for name, patterns in cls.AGENT_PATTERNS.items():
+            if any(re.search(pattern, lower) for pattern in patterns):
+                agent = name
+                break
+
+        task = None
+        match = cls.TASK_PATTERN.search(line)
+        if match and match.group(1).strip():
+            task = match.group(1).strip()[:120]
+
+        browser_connected = None
+        if "browser started" in lower or "browser connected" in lower:
+            browser_connected = True
+        elif "browser disconnected" in lower or "browser crashed" in lower:
+            browser_connected = False
+
+        return LogEvent(
+            raw=line,
+            timestamp=datetime.now().strftime("%H:%M:%S"),
+            level=level,
+            task=task,
+            agent=agent,
+            browser_connected=browser_connected,
+        )
+
+
+class LogTailHandler(FileSystemEventHandler):
+    def __init__(self, log_file: Path, callback):
+        super().__init__()
+        self.log_file = log_file
+        self.callback = callback
+        self.offset = 0
+
+    def bootstrap(self):
+        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        self.log_file.touch(exist_ok=True)
+        self.offset = self.log_file.stat().st_size
+
+    def on_modified(self, event):
+        if Path(event.src_path) != self.log_file:
+            return
+
+        with self.log_file.open("r", encoding="utf-8", errors="ignore") as handle:
+            handle.seek(self.offset)
+            for line in handle:
+                line = line.rstrip("\n")
+                if line:
+                    self.callback(line)
+            self.offset = handle.tell()
 
 
 class OpenClawDashboard(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("OpenClaw Visual Monitor")
-        self.geometry("1500x950")
-        self.minsize(1200, 800)
+        self.title("OpenClaw Visual Monitor — Advanced")
+        self.geometry("1600x980")
+        self.minsize(1280, 820)
 
-        self.cpu_history = deque(maxlen=120)
-        self.ram_history = deque(maxlen=120)
-        self.timeline_events = deque(maxlen=300)
+        self.running = True
         self.event_queue = queue.Queue()
 
+        self.cpu_history = deque(maxlen=180)
+        self.ram_history = deque(maxlen=180)
+        self.timeline_events = deque(maxlen=600)
         self.error_count = 0
+        self.warning_count = 0
+
         self.browser_status = "Disconnected"
         self.current_task = "Idle"
         self.agent_state = {
@@ -45,12 +142,17 @@ class OpenClawDashboard(ctk.CTk):
         }
 
         self.build_ui()
-
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        self.running = True
-        threading.Thread(target=self.update_metrics_worker, daemon=True).start()
-        threading.Thread(target=self.monitor_logs_worker, daemon=True).start()
+        self.log_handler = LogTailHandler(LOG_FILE, self.enqueue_log)
+        self.log_handler.bootstrap()
+        self.observer = Observer()
+        self.observer.schedule(self.log_handler, str(LOG_DIR), recursive=False)
+        self.observer.start()
+
+        threading.Thread(target=self.metrics_worker, daemon=True).start()
+        threading.Thread(target=self.process_health_worker, daemon=True).start()
+
         self.after(100, self.process_events)
 
     def build_ui(self):
@@ -73,67 +175,60 @@ class OpenClawDashboard(ctk.CTk):
         self.timeline_frame.grid(row=1, column=2, sticky="nsew", padx=10, pady=10)
 
         self.build_status_panel()
-        self.build_graphs()
+        self.build_graph_panel()
         self.build_agent_panel()
-        self.build_logs()
-        self.build_timeline()
+        self.build_log_panel()
+        self.build_timeline_panel()
 
     def build_status_panel(self):
-        ctk.CTkLabel(
-            self.status_frame,
-            text="OpenClaw System Status",
-            font=("Arial", 24, "bold"),
-        ).pack(pady=20)
+        ctk.CTkLabel(self.status_frame, text="System Status", font=("Arial", 24, "bold")).pack(pady=14)
 
-        self.cpu_label = ctk.CTkLabel(self.status_frame, text="CPU: 0%", font=("Arial", 18))
-        self.cpu_label.pack(pady=10)
+        self.cpu_label = ctk.CTkLabel(self.status_frame, text="CPU: 0.0%", font=("Arial", 18))
+        self.cpu_label.pack(pady=6)
 
-        self.ram_label = ctk.CTkLabel(self.status_frame, text="RAM: 0%", font=("Arial", 18))
-        self.ram_label.pack(pady=10)
+        self.ram_label = ctk.CTkLabel(self.status_frame, text="RAM: 0.0%", font=("Arial", 18))
+        self.ram_label.pack(pady=6)
 
-        self.browser_label = ctk.CTkLabel(
-            self.status_frame,
-            text="Browser: Disconnected",
-            font=("Arial", 18),
-        )
-        self.browser_label.pack(pady=10)
+        self.process_label = ctk.CTkLabel(self.status_frame, text="OpenClaw Proc: Unknown", font=("Arial", 16))
+        self.process_label.pack(pady=6)
 
-        self.error_label = ctk.CTkLabel(
-            self.status_frame,
-            text="Errors: 0",
-            font=("Arial", 18),
-        )
-        self.error_label.pack(pady=10)
+        self.browser_label = ctk.CTkLabel(self.status_frame, text="Browser: Disconnected", font=("Arial", 18))
+        self.browser_label.pack(pady=6)
+
+        self.error_label = ctk.CTkLabel(self.status_frame, text="Errors: 0", font=("Arial", 18))
+        self.error_label.pack(pady=6)
+
+        self.warning_label = ctk.CTkLabel(self.status_frame, text="Warnings: 0", font=("Arial", 18))
+        self.warning_label.pack(pady=6)
 
         self.task_label = ctk.CTkLabel(
             self.status_frame,
             text="Task: Idle",
-            font=("Arial", 18),
-            wraplength=350,
+            font=("Arial", 16),
+            wraplength=380,
             justify="left",
         )
         self.task_label.pack(pady=10)
 
-        controls = ctk.CTkFrame(self.status_frame)
-        controls.pack(pady=15, padx=10, fill="x")
-        controls.grid_columnconfigure((0, 1), weight=1)
+        command_frame = ctk.CTkFrame(self.status_frame)
+        command_frame.pack(fill="x", padx=10, pady=10)
+        command_frame.grid_columnconfigure((0, 1), weight=1)
 
-        ctk.CTkButton(controls, text="Export Logs", command=self.export_logs).grid(
+        ctk.CTkButton(command_frame, text="Export Logs", command=self.export_logs).grid(
             row=0, column=0, padx=6, pady=6, sticky="ew"
         )
-        ctk.CTkButton(controls, text="Clear Timeline", command=self.clear_timeline).grid(
+        ctk.CTkButton(command_frame, text="Clear Timeline", command=self.clear_timeline).grid(
             row=0, column=1, padx=6, pady=6, sticky="ew"
         )
-        ctk.CTkButton(controls, text="Restart Browser", command=self.restart_browser).grid(
+        ctk.CTkButton(command_frame, text="Restart Browser", command=self.restart_browser).grid(
             row=1, column=0, padx=6, pady=6, sticky="ew"
         )
-        ctk.CTkButton(controls, text="Emergency Stop", command=self.emergency_stop).grid(
+        ctk.CTkButton(command_frame, text="Emergency Stop", command=self.emergency_stop).grid(
             row=1, column=1, padx=6, pady=6, sticky="ew"
         )
 
-    def build_graphs(self):
+    def build_graph_panel(self):
         self.fig = Figure(figsize=(7, 5), dpi=100)
-
         self.ax1 = self.fig.add_subplot(211)
         self.ax2 = self.fig.add_subplot(212)
 
@@ -141,155 +236,137 @@ class OpenClawDashboard(ctk.CTk):
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
     def build_agent_panel(self):
-        ctk.CTkLabel(
-            self.agent_frame,
-            text="Autonomous Agent Graph",
-            font=("Arial", 22, "bold"),
-        ).pack(pady=10)
+        ctk.CTkLabel(self.agent_frame, text="Agent Activity", font=("Arial", 22, "bold")).pack(pady=10)
 
         self.agent_labels = {}
-        for name in self.agent_state:
-            label = ctk.CTkLabel(self.agent_frame, text=f"{name}: IDLE", font=("Arial", 16))
-            label.pack(anchor="w", padx=14, pady=4)
-            self.agent_labels[name] = label
-
-        ctk.CTkLabel(
-            self.agent_frame,
-            text="Real-Time Activity Map",
-            font=("Arial", 18, "bold"),
-        ).pack(pady=(20, 8))
+        for agent_name in self.agent_state:
+            label = ctk.CTkLabel(self.agent_frame, text=f"{agent_name}: IDLE", font=("Arial", 15))
+            label.pack(anchor="w", padx=12, pady=3)
+            self.agent_labels[agent_name] = label
 
         self.activity_box = ctk.CTkTextbox(self.agent_frame, height=220)
         self.activity_box.pack(fill="both", expand=True, padx=10, pady=10)
 
-    def build_logs(self):
-        ctk.CTkLabel(
-            self.log_frame,
-            text="Live OpenClaw Logs",
-            font=("Arial", 22, "bold"),
-        ).pack(pady=10)
-
-        self.log_box = ctk.CTkTextbox(self.log_frame, height=300)
+    def build_log_panel(self):
+        ctk.CTkLabel(self.log_frame, text="Live OpenClaw Logs", font=("Arial", 22, "bold")).pack(pady=8)
+        self.log_box = ctk.CTkTextbox(self.log_frame, height=320)
         self.log_box.pack(fill="both", expand=True, padx=10, pady=10)
 
-    def build_timeline(self):
-        ctk.CTkLabel(
-            self.timeline_frame,
-            text="AI Decision Timeline",
-            font=("Arial", 22, "bold"),
-        ).pack(pady=10)
-
+    def build_timeline_panel(self):
+        ctk.CTkLabel(self.timeline_frame, text="AI Decision Timeline", font=("Arial", 22, "bold")).pack(pady=8)
         self.timeline_box = ctk.CTkTextbox(self.timeline_frame)
         self.timeline_box.pack(fill="both", expand=True, padx=10, pady=10)
 
-    def update_metrics_worker(self):
+    def enqueue_log(self, line: str):
+        self.event_queue.put(("log", line))
+
+    def metrics_worker(self):
         while self.running:
-            cpu = psutil.cpu_percent(interval=1)
-            ram = psutil.virtual_memory().percent
-            self.event_queue.put(("metrics", cpu, ram))
+            cpu_percent = psutil.cpu_percent(interval=1)
+            ram_percent = psutil.virtual_memory().percent
+            self.event_queue.put(("metrics", cpu_percent, ram_percent))
 
-    def monitor_logs_worker(self):
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        LOG_FILE.touch(exist_ok=True)
-
-        with LOG_FILE.open("r", encoding="utf-8", errors="ignore") as file:
-            file.seek(0, os.SEEK_END)
-            while self.running:
-                line = file.readline()
-                if not line:
-                    time.sleep(0.2)
+    def process_health_worker(self):
+        while self.running:
+            openclaw_related = 0
+            openclaw_cpu = 0.0
+            for proc in psutil.process_iter(attrs=["name", "cmdline", "cpu_percent"]):
+                try:
+                    name = (proc.info.get("name") or "").lower()
+                    cmdline = " ".join(proc.info.get("cmdline") or []).lower()
+                    if "openclaw" in name or "openclaw" in cmdline:
+                        openclaw_related += 1
+                        openclaw_cpu += float(proc.info.get("cpu_percent") or 0.0)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
-                self.event_queue.put(("log", line.rstrip("\n")))
+
+            self.event_queue.put(("proc", openclaw_related, openclaw_cpu))
+            time.sleep(2)
 
     def process_events(self):
         while not self.event_queue.empty():
             event = self.event_queue.get_nowait()
+            kind = event[0]
 
-            if event[0] == "metrics":
+            if kind == "metrics":
                 self.handle_metrics(event[1], event[2])
-            elif event[0] == "log":
-                self.process_log_line(event[1])
+            elif kind == "log":
+                self.handle_log(event[1])
+            elif kind == "proc":
+                self.process_label.configure(text=f"OpenClaw Proc: {event[1]} | CPU: {event[2]:.1f}%")
 
         if self.running:
             self.after(100, self.process_events)
 
-    def handle_metrics(self, cpu, ram):
+    def handle_metrics(self, cpu: float, ram: float):
         self.cpu_history.append(cpu)
         self.ram_history.append(ram)
 
         self.cpu_label.configure(text=f"CPU: {cpu:.1f}%")
         self.ram_label.configure(text=f"RAM: {ram:.1f}%")
 
-        self.update_graphs()
-
-    def update_graphs(self):
         self.ax1.clear()
         self.ax2.clear()
 
-        self.ax1.plot(list(self.cpu_history), color="#5DADE2")
+        self.ax1.plot(list(self.cpu_history), color="#4aa3ff", linewidth=1.3)
         self.ax1.set_ylim(0, 100)
         self.ax1.set_title("CPU Usage")
 
-        self.ax2.plot(list(self.ram_history), color="#58D68D")
+        self.ax2.plot(list(self.ram_history), color="#2ecc71", linewidth=1.3)
         self.ax2.set_ylim(0, 100)
         self.ax2.set_title("RAM Usage")
 
-        self.fig.tight_layout(pad=1.5)
+        self.fig.tight_layout(pad=1.4)
         self.canvas.draw_idle()
 
-    def process_log_line(self, line):
-        if not line:
-            return
+    def handle_log(self, line: str):
+        event = LogClassifier.classify(line)
 
         self.log_box.insert("end", line + "\n")
         self.log_box.see("end")
 
-        lower = line.lower()
-        timestamp = datetime.now().strftime("%H:%M:%S")
-
-        if "error" in lower or "failed" in lower:
+        if event.level == "ERROR":
             self.error_count += 1
             self.error_label.configure(text=f"Errors: {self.error_count}")
-            self.add_timeline_event(timestamp, f"ERROR: {line}")
             self.update_agent("Recovery Agent", "RUNNING")
+        elif event.level == "WARN":
+            self.warning_count += 1
+            self.warning_label.configure(text=f"Warnings: {self.warning_count}")
 
-        if "browser started" in lower or "browser connected" in lower:
-            self.browser_status = "Connected"
-            self.browser_label.configure(text="Browser: Connected")
-            self.add_timeline_event(timestamp, "Browser connected")
-            self.update_agent("Browser Agent", "RUNNING")
+        if event.browser_connected is not None:
+            self.browser_status = "Connected" if event.browser_connected else "Disconnected"
+            self.browser_label.configure(text=f"Browser: {self.browser_status}")
+            self.update_agent("Browser Agent", "RUNNING" if event.browser_connected else "IDLE")
 
-        if "browser disconnected" in lower:
-            self.browser_status = "Disconnected"
-            self.browser_label.configure(text="Browser: Disconnected")
-            self.add_timeline_event(timestamp, "Browser disconnected")
-            self.update_agent("Browser Agent", "IDLE")
-
-        if "task" in lower:
-            self.current_task = line[:80]
+        if event.task:
+            self.current_task = event.task
             self.task_label.configure(text=f"Task: {self.current_task}")
-            self.add_timeline_event(timestamp, f"Task update: {self.current_task}")
             self.update_agent("Planner Agent", "ACTIVE")
 
-        if "vision" in lower or "ocr" in lower:
-            self.update_agent("Vision Agent", "SCANNING")
+        if event.agent:
+            updated_state = {
+                "ERROR": "FAIL",
+                "WARN": "WAITING",
+                "INFO": "RUNNING",
+            }.get(event.level, "RUNNING")
+            self.update_agent(event.agent, updated_state)
 
-        if "verify" in lower or "validated" in lower:
-            self.update_agent("Verifier Agent", "WAITING")
-
-        self.activity_box.insert("end", f"[{timestamp}] {line}\n")
+        self.add_timeline_event(event.timestamp, f"{event.level}: {event.raw[:140]}")
+        self.activity_box.insert("end", f"[{event.timestamp}] {event.raw}\n")
         self.activity_box.see("end")
 
-    def update_agent(self, agent_name, status):
-        self.agent_state[agent_name] = status
-        label = self.agent_labels.get(agent_name)
-        if label:
-            label.configure(text=f"{agent_name}: {status}")
+    def update_agent(self, agent_name: str, status: str):
+        if agent_name not in self.agent_state:
+            return
 
-    def add_timeline_event(self, timestamp, message):
-        event = f"{timestamp}  {message}"
-        self.timeline_events.append(event)
-        self.timeline_box.insert("end", event + "\n")
+        self.agent_state[agent_name] = status
+        label = self.agent_labels[agent_name]
+        label.configure(text=f"{agent_name}: {status}")
+
+    def add_timeline_event(self, timestamp: str, description: str):
+        event_text = f"{timestamp}  {description}"
+        self.timeline_events.append(event_text)
+        self.timeline_box.insert("end", event_text + "\n")
         self.timeline_box.see("end")
 
     def clear_timeline(self):
@@ -297,28 +374,37 @@ class OpenClawDashboard(ctk.CTk):
         self.timeline_box.delete("1.0", "end")
 
     def restart_browser(self):
-        self.add_timeline_event(datetime.now().strftime("%H:%M:%S"), "Command: Restart Browser")
+        self.add_timeline_event(datetime.now().strftime("%H:%M:%S"), "Command Center: Restart Browser")
         self.update_agent("Browser Agent", "RUNNING")
 
     def emergency_stop(self):
-        self.add_timeline_event(datetime.now().strftime("%H:%M:%S"), "Command: Emergency Stop")
-        for name in self.agent_state:
-            self.update_agent(name, "IDLE")
+        self.add_timeline_event(datetime.now().strftime("%H:%M:%S"), "Command Center: Emergency Stop")
+        for agent in self.agent_state:
+            self.update_agent(agent, "IDLE")
 
     def export_logs(self):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        export_name = BASE_DIR / f"exported_logs_{timestamp}.txt"
+        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        filename = f"openclaw_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        target = EXPORT_DIR / filename
 
         if LOG_FILE.exists():
-            export_name.write_text(LOG_FILE.read_text(encoding="utf-8"), encoding="utf-8")
-            self.log_box.insert("end", f"\n[+] Logs exported to {export_name.name}\n")
+            target.write_text(LOG_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+            self.log_box.insert("end", f"\n[+] Logs exported: {target.relative_to(BASE_DIR)}\n")
             self.log_box.see("end")
 
     def on_close(self):
         self.running = False
+
+        if hasattr(self, "observer"):
+            self.observer.stop()
+            self.observer.join(timeout=2)
+
         self.destroy()
 
 
 if __name__ == "__main__":
+    os.makedirs(LOG_DIR, exist_ok=True)
+    LOG_FILE.touch(exist_ok=True)
+
     app = OpenClawDashboard()
     app.mainloop()
