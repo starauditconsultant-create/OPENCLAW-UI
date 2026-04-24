@@ -1,0 +1,6 @@
+customtkinter
+matplotlib
+psutil
+watchdog
+pyinstaller
+plyer
